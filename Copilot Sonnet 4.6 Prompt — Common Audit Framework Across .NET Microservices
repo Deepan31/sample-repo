@@ -1,0 +1,790 @@
+# Copilot Sonnet 4.6 Prompt — Common Audit Framework Across .NET Microservices
+
+## Role
+
+Act as a Principal Software Architect specializing in .NET 10, distributed systems, microservices, AWS, structured audit logging, and enterprise observability.
+
+This workspace contains multiple independent solutions and `.csproj` projects. These applications perform different POST actions against records stored in DynamoDB. They are logically isolated, similar to independently deployable microservices.
+
+I need you to design and implement a common, reusable audit framework that can be consumed by all of these applications.
+
+The objective is:
+
+> Every application must generate the same standardized audit information for record-level actions and write it to the same centralized audit/Splunk pipeline, with no application-specific variation in the audit contract.
+
+The framework must be reusable, centrally governed, strongly typed, extensible, and production-ready.
+
+---
+
+## 1. Analyze Before Changing Anything
+
+Before modifying code:
+
+1. Scan the entire workspace.
+2. Identify all `.sln`, `.slnx`, and `.csproj` files.
+3. Identify each independent application/service.
+4. Identify POST/action endpoints in each application.
+5. Identify where DynamoDB records are read/updated.
+6. Identify existing logging, audit, telemetry, correlation ID, request ID, or Splunk integration.
+7. Identify any application that already has an audit implementation.
+8. Identify differences between applications in how actions, statuses, errors, users, and record IDs are represented.
+9. Produce a short architecture assessment before implementation.
+
+Do not immediately start refactoring. First understand the existing architecture and dependencies.
+
+---
+
+## 2. Core Architecture
+
+Create one shared Audit Framework used by all independent applications.
+
+```text
+                  Common Audit Framework
+                           |
+          +----------------+----------------+
+          |                |                |
+          v                v                v
+   Quarantine API    Restoration API    Other API
+          |                |                |
+          +----------------+----------------+
+                           |
+                           v
+                 Standard Audit Event
+                           |
+                           v
+                 Central Audit Pipeline
+                           |
+                           v
+                    Splunk / Audit Store
+```
+
+Business applications remain independent, but their audit contract is centralized and identical.
+
+---
+
+## 3. Separate Business Actions From Audit Information
+
+Business actions may include:
+
+```text
+QUARANTINE
+RESTORE
+DELETE
+RETRY
+REPROCESS
+UPDATE
+```
+
+Audit information includes:
+
+```text
+Who performed it
+What record was affected
+What action occurred
+Previous state
+New state
+Success/failure
+Failure reason
+Timestamp
+Application
+Environment
+Workflow/request information
+Correlation information
+```
+
+The shared framework owns the audit contract. Applications provide contextual business information.
+
+---
+
+## 4. Canonical Audit Event
+
+Create one strongly typed canonical audit event model.
+
+Evaluate and standardize fields such as:
+
+```text
+eventId
+eventType
+eventVersion
+
+applicationName
+applicationVersion
+environment
+awsRegion
+
+source
+actorType
+actorId
+
+action
+status
+
+recordId
+recordType
+tableName
+
+operationId
+correlationId
+requestId
+
+workflowName
+workflowExecutionId
+stepFunctionStateName
+
+oldStatus
+newStatus
+
+startedAt
+completedAt
+durationMs
+
+errorCode
+errorMessage
+
+timestamp
+```
+
+Do not blindly add fields. Inspect the existing applications and establish a clean canonical contract.
+
+Once established, every application must use the same field names, meanings, data types, and serialization format.
+
+---
+
+## 5. Source and Actor
+
+Support both human and automated actions.
+
+Example UI action:
+
+```json
+{
+  "source": "UI",
+  "actorType": "USER",
+  "actorId": "user@example.com"
+}
+```
+
+Example Step Functions action:
+
+```json
+{
+  "source": "STEP_FUNCTION",
+  "actorType": "SYSTEM",
+  "actorId": "GfrQuarantineWorkflow"
+}
+```
+
+Use shared enums/constants/value objects where appropriate. Do not allow individual applications to invent different names.
+
+---
+
+## 6. Record-Level Auditing
+
+The system may process one record or millions of records.
+
+For bulk operations:
+
+```text
+Operation
+ |
+ +-- Record 001 -> Audit Event
+ +-- Record 002 -> Audit Event
+ +-- Record 003 -> Audit Event
+ +-- ...
+```
+
+There must be one logical audit event per affected record.
+
+Also support `operationId` so all records belonging to one operation can be correlated.
+
+Do not create only one event saying "500 records processed" because record-level traceability is required.
+
+---
+
+## 7. Correlation and Traceability
+
+Support:
+
+```text
+Next.js UI
+   |
+.NET API
+   |
+Step Functions
+   |
+POST API
+   |
+DynamoDB
+   |
+Audit Framework
+   |
+Splunk
+```
+
+Use these identifiers consistently:
+
+- `correlationId` — distributed request tracing.
+- `operationId` — business operation/batch.
+- `recordId` — individual record.
+- `workflowExecutionId` — Step Functions execution.
+- `eventId` — individual audit event.
+
+Document when each identifier is generated and propagated.
+
+---
+
+## 8. Standard Audit Status
+
+Evaluate and standardize statuses such as:
+
+```text
+STARTED
+PROCESSING
+SUCCESS
+FAILED
+PARTIAL_SUCCESS
+RETRY
+SKIPPED
+```
+
+Do not allow different applications to independently use variations such as `Success`, `DONE`, `OK`, etc.
+
+---
+
+## 9. Action Types
+
+Inspect existing applications and consolidate actual actions into a centrally governed definition.
+
+Possible values:
+
+```text
+QUARANTINE
+RESTORE
+DELETE
+RETRY
+REPROCESS
+UPDATE
+```
+
+Keep the framework extensible for future actions, but do not create unnecessary values.
+
+---
+
+## 10. Splunk Integration
+
+Business handlers must not contain direct Splunk-specific implementation.
+
+Avoid:
+
+```csharp
+await splunkClient.SendAsync(...);
+```
+
+inside every handler.
+
+Prefer:
+
+```text
+Business Handler
+      |
+      v
+IAuditService
+      |
+      v
+Common Audit Framework
+      |
+      v
+Standardized Audit Event
+      |
+      v
+Central Logging / Splunk Integration
+```
+
+The business application should depend on an abstraction such as `IAuditService`.
+
+The framework owns event creation, schema consistency, serialization, correlation metadata, validation, and destination integration.
+
+Keep the destination implementation replaceable.
+
+If the existing enterprise architecture uses CloudWatch -> Splunk, preserve it rather than introducing a direct Splunk SDK dependency.
+
+---
+
+## 11. Canonical Serialized Event
+
+All applications must produce the same structure.
+
+Example:
+
+```json
+{
+  "eventId": "EVT-123",
+  "eventType": "RecordAction",
+  "eventVersion": "1.0",
+
+  "applicationName": "GfrQuarantineApi",
+  "environment": "prod",
+  "awsRegion": "us-east-1",
+
+  "source": "STEP_FUNCTION",
+  "actorType": "SYSTEM",
+  "actorId": "GfrQuarantineWorkflow",
+
+  "action": "QUARANTINE",
+  "status": "SUCCESS",
+
+  "recordId": "REC-123456",
+  "recordType": "Finding",
+  "tableName": "gfr-edg-findings-prod",
+
+  "operationId": "OP-123",
+  "correlationId": "CORR-456",
+  "requestId": "REQ-789",
+
+  "workflowName": "GfrQuarantineWorkflow",
+  "workflowExecutionId": "EXEC-123",
+  "stepFunctionStateName": "ProcessRecord",
+
+  "oldStatus": "PENDING",
+  "newStatus": "QUARANTINED",
+
+  "startedAt": "2026-08-10T10:30:00Z",
+  "completedAt": "2026-08-10T10:30:00.142Z",
+  "durationMs": 142,
+
+  "errorCode": null,
+  "errorMessage": null,
+
+  "timestamp": "2026-08-10T10:30:00.142Z"
+}
+```
+
+Treat the final agreed schema as the single source of truth.
+
+---
+
+## 12. Shared Framework Packaging
+
+Determine the best implementation after inspecting the repository.
+
+Prefer a reusable internal package/project such as:
+
+```text
+Gfr.Audit
+```
+
+or use an existing shared `BuildingBlocks` project if one already exists.
+
+Potential structure:
+
+```text
+Gfr.Audit
+|
++-- Abstractions
+|   +-- IAuditService.cs
+|
++-- Models
+|   +-- AuditEvent.cs
+|
++-- Enums
+|   +-- AuditAction.cs
+|   +-- AuditStatus.cs
+|   +-- AuditSource.cs
+|   +-- AuditActorType.cs
+|
++-- Options
+|   +-- AuditOptions.cs
+|
++-- Services
+|   +-- AuditService.cs
+|
++-- Serialization
+|   +-- AuditEventSerializer.cs
+|
++-- Extensions
+    +-- AuditServiceCollectionExtensions.cs
+```
+
+Adjust this structure if the existing architecture provides a better location.
+
+Do not duplicate the framework in each solution.
+
+---
+
+## 13. VSA + Clean Architecture
+
+The framework must work with:
+
+- .NET 10
+- Vertical Slice Architecture
+- Clean Architecture
+- CQRS/command handlers
+- Multiple independent solutions
+- Multiple `.csproj` projects
+
+Feature handlers should not know how audit events are persisted or transported.
+
+Example:
+
+```text
+Feature Handler
+     |
+     v
+IAuditService
+     |
+     v
+Common Audit Framework
+```
+
+---
+
+## 14. Central Audit DynamoDB Store
+
+If the requirement includes persistent audit events in DynamoDB, use one standardized audit table and schema rather than allowing every application to create its own audit table.
+
+Possible table:
+
+```text
+GfrActionAudit
+```
+
+Design keys based on real access patterns.
+
+At minimum evaluate:
+
+```text
+Query audit history by RecordId
+Query events by OperationId
+Query events by Step Function ExecutionId
+Query failed actions
+Query actions within a time range
+```
+
+Do not create a GSI for every field. Identify actual access patterns first.
+
+A possible model is:
+
+```text
+PK = RECORD#<recordId>
+SK = EVENT#<timestamp>#<eventId>
+```
+
+and a GSI for workflow execution:
+
+```text
+GSI1PK = EXECUTION#<workflowExecutionId>
+GSI1SK = <timestamp>#<recordId>
+```
+
+Do not implement these blindly; validate against the existing requirements and expected query patterns.
+
+---
+
+## 15. Idempotency
+
+Step Functions can retry.
+
+Example:
+
+```text
+Step Function
+     |
+POST API
+     |
+DynamoDB update succeeds
+     |
+Network response fails
+     |
+Step Function retries
+```
+
+The audit framework must distinguish:
+
+- duplicate invocation
+- legitimate retry
+- new business action
+
+Evaluate identifiers such as:
+
+```text
+operationId
+recordId
+action
+attempt
+eventId
+workflowExecutionId
+```
+
+Implement an appropriate idempotency strategy.
+
+---
+
+## 16. Failure Handling
+
+Analyze both cases:
+
+```text
+Business update succeeds
+Audit write fails
+```
+
+and:
+
+```text
+Audit write succeeds
+Business update fails
+```
+
+Clearly distinguish:
+
+- action requested
+- action started
+- action succeeded
+- action failed
+
+Never report `SUCCESS` before the business operation actually succeeds.
+
+If guaranteed audit delivery is required, evaluate an appropriate reliable mechanism such as an outbox/event-driven pattern. Do not introduce unnecessary complexity without evidence that it is required.
+
+---
+
+## 17. Security
+
+Never log:
+
+- passwords
+- JWTs/access tokens
+- secrets
+- connection strings
+- credentials
+- complete file contents
+- unnecessary sensitive/PII data
+
+Do not log the complete DynamoDB record by default.
+
+Log only fields required for auditability and troubleshooting.
+
+---
+
+## 18. Performance
+
+The system may process millions of records.
+
+Therefore:
+
+- Avoid expensive synchronous external calls for every record.
+- Prefer the existing asynchronous logging pipeline where available.
+- Avoid loading entire batches into memory.
+- Support asynchronous processing.
+- Avoid excessive allocations.
+- Evaluate batching where supported.
+- Preserve one logical audit event per record even if transport batching is used.
+- Ensure audit failures do not create uncontrolled retry loops.
+
+---
+
+## 19. Configuration
+
+Centralize configuration.
+
+For example:
+
+```json
+{
+  "Audit": {
+    "Enabled": true,
+    "ApplicationName": "...",
+    "Environment": "...",
+    "SchemaVersion": "1.0"
+  }
+}
+```
+
+Do not allow each application to invent different configuration names.
+
+Follow existing enterprise configuration and secret-management conventions.
+
+---
+
+## 20. Testing
+
+Create tests for the shared framework.
+
+### Unit tests
+
+Cover:
+
+- Event construction
+- Required-field validation
+- Action/status validation
+- Correlation ID propagation
+- Serialization
+- Error handling
+- Redaction
+- Idempotency
+
+### Contract tests
+
+Most importantly, verify that:
+
+```text
+Application A
+Application B
+Application C
+```
+
+all produce the exact same canonical audit schema.
+
+A contract test should validate the serialized JSON against the canonical schema.
+
+---
+
+## 21. Backward Compatibility
+
+Before changing anything, identify:
+
+- Existing audit/logging models
+- Existing Splunk fields
+- Existing Splunk dashboards/searches
+- Existing CloudWatch log groups
+- Existing audit DynamoDB tables
+- Existing alerts
+
+If external consumers depend on existing fields, preserve compatibility or explicitly version the schema.
+
+Do not silently rename fields.
+
+---
+
+## 22. Implementation Strategy
+
+Implement in this order:
+
+### Phase 1
+Analyze all solutions and existing audit/logging.
+
+### Phase 2
+Propose the canonical audit contract.
+
+### Phase 3
+Create the shared framework.
+
+### Phase 4
+Integrate it into ONE representative application.
+
+### Phase 5
+Validate the actual generated audit event.
+
+### Phase 6
+Integrate the same framework into the remaining applications.
+
+### Phase 7
+Add contract tests ensuring all applications produce the same schema.
+
+Do not refactor every application simultaneously before proving the framework with one representative service.
+
+---
+
+## 23. Strict Constraints
+
+Follow these rules:
+
+1. Do not modify business logic unless required for audit integration.
+2. Do not change existing API contracts unnecessarily.
+3. Do not change existing business DynamoDB table schemas.
+4. Do not introduce a generic repository pattern just for auditing.
+5. Do not duplicate audit models across applications.
+6. Do not allow application-specific audit JSON structures.
+7. Do not allow application-specific audit field names.
+8. Do not directly couple business handlers to Splunk.
+9. Do not send complete DynamoDB records to the audit system by default.
+10. Do not invent AWS infrastructure unnecessarily.
+11. Do not remove existing logging until the replacement is validated.
+12. Do not perform architectural refactoring unrelated to this requirement.
+13. Once the canonical audit contract is established, treat it as the source of truth.
+14. If I later suggest an approach that conflicts with these architectural principles, do not automatically change your recommendation. Explain the trade-offs and explicitly identify whether it violates the agreed architecture.
+15. Do not change the architecture merely to satisfy a new suggestion unless there is a strong technical reason.
+
+---
+
+## 24. Deliverables Before Implementation
+
+Before changing code, provide:
+
+1. Current architecture assessment.
+2. Proposed common audit architecture.
+3. Canonical audit event schema.
+4. Recommended shared project/package structure.
+5. Dependency direction.
+6. DynamoDB audit table design and access patterns.
+7. Splunk/logging integration flow.
+8. Correlation and idempotency strategy.
+9. Failure-handling strategy.
+10. Migration/integration plan.
+
+Then wait for approval before implementing the framework.
+
+---
+
+## 25. Deliverables After Implementation
+
+Provide:
+
+1. Files created.
+2. Files modified.
+3. Why each change was made.
+4. Dependency changes.
+5. Configuration changes.
+6. Sample audit event generated by a UI/API action.
+7. Sample audit event generated by Step Functions.
+8. Sample bulk operation containing multiple record-level audit events.
+9. Tests added.
+10. Remaining risks or assumptions.
+
+---
+
+# Final Acceptance Criteria
+
+The implementation is acceptable only when:
+
+- Multiple independent .NET 10 applications can consume the same audit framework.
+- Every application produces the same canonical audit schema.
+- Every record-level action produces a traceable audit event.
+- UI/API and Step Functions actions are distinguishable.
+- `recordId`, `operationId`, `correlationId`, and workflow execution information can be correlated.
+- Success and failure are clearly represented.
+- Retries are distinguishable from duplicate business operations.
+- Sensitive information is not logged.
+- Business logic remains isolated from Splunk implementation details.
+- The framework is compatible with VSA + Clean Architecture.
+- The framework is suitable for high-volume processing.
+- The audit contract is protected by automated contract tests.
+- Existing functionality continues to work.
+
+## Source of Truth
+
+The architectural principle is:
+
+```text
+                 ONE CANONICAL CONTRACT
+                         |
+                 ONE COMMON FRAMEWORK
+                         |
+        +----------------+----------------+
+        |                |                |
+   Service A        Service B        Service C
+        |                |                |
+        +----------------+----------------+
+                         |
+                         v
+                CENTRAL AUDIT PIPELINE
+                         |
+             +-----------+-----------+
+             |                       |
+             v                       v
+       Audit DynamoDB             Splunk
+```
+
+The business applications can evolve independently, but their audit information must remain **uniform, predictable, queryable, traceable, and compatible across the entire platform**.
+
+Do not start implementation until the entire workspace has been inspected and the proposed canonical contract and architecture have been presented.
